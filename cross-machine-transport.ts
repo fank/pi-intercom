@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
-import { DIRECT_SSH_OPTIONS, discoverRemoteAgent, type RemoteAgent, type SavedMachine } from "./cross-machine-discovery.ts";
+import { DIRECT_SSH_OPTIONS, discoverRemoteAgent, listMachineAgents, listSavedMachines, resolveRemoteMachine, remoteCommandFor, validateRemoteCommand, type RemoteAgent, type SavedMachine } from "./cross-machine-discovery.ts";
+import type { CrossMachineHostConfig } from "./config.ts";
 import type { CrossMachineEnvelope, CrossMachineOrigin } from "./cross-machine-envelope.ts";
 
 export const DELIVERY_TIMEOUT_MS = 15_000;
@@ -17,8 +18,23 @@ export interface CrossMachineDeps {
   run?: CommandRunner;
   herdrBin?: string;
   remoteCommand?: string;
+  machines?: Record<string, CrossMachineHostConfig>;
+  exactSessionId?: boolean;
   discoveryTimeoutMs?: number;
   deliveryTimeoutMs?: number;
+}
+
+export interface RemoteRoster {
+  machines?: SavedMachine[];
+  machine?: SavedMachine;
+  agents?: RemoteAgent[];
+}
+
+export async function listRemotePeers(machineLabel?: string, deps: CrossMachineDeps = {}): Promise<RemoteRoster> {
+  const discovery = { ...deps, run: deps.run ?? runCommand, herdrBin: deps.herdrBin ?? process.env.HERDR_BIN_PATH ?? "herdr" };
+  if (!machineLabel) return { machines: await listSavedMachines(discovery) };
+  const machine = await resolveRemoteMachine(machineLabel, discovery);
+  return { machine, agents: await listMachineAgents(machine, discovery) };
 }
 
 export interface CrossMachineDelivery {
@@ -99,28 +115,35 @@ export async function sendCrossMachine(
 ): Promise<CrossMachineDelivery> {
   const run = deps.run ?? runCommand;
   const herdr = deps.herdrBin ?? process.env.HERDR_BIN_PATH ?? "herdr";
-  const remoteCommand = deps.remoteCommand ?? "pi-intercom";
-  if (remoteCommand.trim().length === 0) throw new Error("Remote command must not be empty.");
-  // SSH interprets its remote command string, so control characters are not safe here.
-  if (/[\x00-\x1f\x7f]/.test(remoteCommand)) throw new Error("Remote command must not contain ASCII control characters.");
+  const remoteCommand = validateRemoteCommand(deps.remoteCommand ?? "pi-intercom");
   const match = await discoverRemoteAgent(target, {
     run,
     herdrBin: herdr,
     remoteCommand,
+    machines: deps.machines,
+    exactSessionId: deps.exactSessionId,
     ...(deps.discoveryTimeoutMs === undefined ? {} : { discoveryTimeoutMs: deps.discoveryTimeoutMs }),
   });
   const envelope: CrossMachineEnvelope = { version: 1, target: match.agent.sessionId ?? match.agent.name, text, origin, trust: "ssh-asserted" };
-  const delivered = await run(
-    "ssh",
-    [...(match.viaSsh ? DIRECT_SSH_OPTIONS : []), match.machine.target, `${remoteCommand} relay --envelope-stdin --json`],
-    `${JSON.stringify(envelope)}\n`,
-    deps.deliveryTimeoutMs ?? DELIVERY_TIMEOUT_MS,
-  );
+  let delivered: CommandResult;
+  try {
+    delivered = await run(
+      "ssh",
+      [...DIRECT_SSH_OPTIONS, match.machine.target, `${remoteCommandFor(match.machine, { run, herdrBin: herdr, remoteCommand })} relay --envelope-stdin --json`],
+      `${JSON.stringify(envelope)}\n`,
+      deps.deliveryTimeoutMs ?? DELIVERY_TIMEOUT_MS,
+    );
+  } catch (error) {
+    throw new Error(`SSH relay via ${match.machine.label} failed: ${(error as Error).message}. Delivery outcome is unknown; do not automatically retry.`);
+  }
+  if (delivered.timedOut || delivered.code === 255) {
+    throw new Error(`SSH relay via ${match.machine.label} ${delivered.timedOut ? "timed out" : `failed (exit ${delivered.code})`}: ${delivered.stderr.trim().slice(0, 1000)}. Delivery outcome is unknown; check SSH connectivity/host keys before an explicit retry.`);
+  }
   let response: unknown;
   try {
     response = JSON.parse(delivered.stdout);
   } catch {
-    throw relaySupportError(match.machine.label);
+    throw new Error(`SSH relay via ${match.machine.label} returned no valid JSON (exit ${delivered.code}): ${delivered.stderr.trim().slice(0, 1000) || "empty or non-JSON response"}. Check the remote command/relay version. Delivery outcome is unknown; do not automatically retry.`);
   }
   if (!isRecord(response) || typeof response.ok !== "boolean" || ("version" in response && response.version !== 1)) {
     throw relaySupportError(match.machine.label);
@@ -129,5 +152,6 @@ export async function sendCrossMachine(
     if (typeof response.error !== "string") throw relaySupportError(match.machine.label);
     throw new Error(`Remote intercom delivery via ${match.machine.label} failed: ${response.error}`);
   }
+  if (response.delivered !== true) throw new Error(`Remote intercom on ${match.machine.label} did not confirm delivery. Delivery outcome is unknown; do not automatically retry.`);
   return { ...match, stdout: delivered.stdout };
 }

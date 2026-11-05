@@ -29,17 +29,18 @@ import {
   resolveOrigin,
   type CrossMachineEnvelope,
 } from "./cross-machine-envelope.ts";
-import { sendCrossMachine, type CrossMachineDelivery } from "./cross-machine-transport.ts";
+import { listRemotePeers, sendCrossMachine, type RemoteRoster, type CrossMachineDelivery } from "./cross-machine-transport.ts";
 import { parseCrossMachineTarget } from "./cross-machine-discovery.ts";
 import type { CrossMachineProvenance, Message, SessionInfo, SessionRegistration } from "./types.ts";
 
-export const CLI_USAGE = `usage: pi-intercom <list|send|ask> [--to <name|session-id>] [--text <message>]
-                        [--timeout-ms <n>] [--no-wake] [--name <session-name>] [--json]`;
+export const CLI_USAGE = `usage: pi-intercom <list|list-remote|send|ask> [--to <name|session-id>] [--text <message>]
+                        [--machine <saved-machine>] [--timeout-ms <n>] [--no-wake] [--name <session-name>] [--json]\nlist is local/pool-scoped; list-remote without --machine lists trusted machines.\nUse a listed alias@machine for cross-host send. Plain SSH CLI send is destination-local, not a two-way bridge.`;
 
 export const DEFAULT_ASK_TIMEOUT_MS = 120_000;
 
 export interface CliOptions {
-  command: "list" | "send" | "ask" | "relay";
+  command: "list" | "list-remote" | "send" | "ask" | "relay";
+  machine: string | null;
   to: string | null;
   text: string | null;
   envelopeStdin: boolean;
@@ -54,6 +55,7 @@ export class CliUsageError extends Error {}
 export function parseCliArgs(argv: readonly string[]): CliOptions {
   const opts: CliOptions = {
     command: null as unknown as CliOptions["command"],
+    machine: null,
     to: null,
     text: null,
     envelopeStdin: false,
@@ -64,7 +66,7 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
   };
 
   const [command, ...rest] = argv;
-  if (command !== "list" && command !== "send" && command !== "ask" && command !== "relay") {
+  if (command !== "list" && command !== "send" && command !== "ask" && command !== "relay" && command !== "list-remote") {
     throw new CliUsageError(`unknown command: ${String(command)}\n${CLI_USAGE}`);
   }
   opts.command = command;
@@ -94,7 +96,9 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
     if (value === undefined) {
       throw new CliUsageError(`missing value for ${arg}\n${CLI_USAGE}`);
     }
-    if (arg === "--to") {
+    if (arg === "--machine") {
+      opts.machine = value;
+    } else if (arg === "--to") {
       opts.to = value;
     } else if (arg === "--text") {
       opts.text = value;
@@ -119,7 +123,8 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
   } else {
     if (opts.envelopeStdin) throw new CliUsageError(`--envelope-stdin is only valid for relay\n${CLI_USAGE}`);
     if (opts.noWake && opts.command !== "send") throw new CliUsageError(`--no-wake is only valid for send\n${CLI_USAGE}`);
-    if (opts.command !== "list") {
+    if (opts.machine && opts.command !== "list-remote") throw new CliUsageError("--machine is only valid for list-remote");
+    if (opts.command !== "list" && opts.command !== "list-remote") {
       if (!opts.to) throw new CliUsageError(`--to is required for ${opts.command}\n${CLI_USAGE}`);
       if (!opts.text) throw new CliUsageError(`--text is required for ${opts.command}\n${CLI_USAGE}`);
     }
@@ -145,6 +150,7 @@ export interface CliDeps {
   readStdin?: () => Promise<string>;
   crossMachineSend?: (target: string, text: string, origin: ReturnType<typeof resolveOrigin>) => Promise<CrossMachineDelivery>;
   machineName?: string;
+  listRemote?: (machine?: string) => Promise<RemoteRoster>;
 }
 
 export function buildCliRegistration(name: string, now = Date.now(), runtimeFallbackAlias = false): SessionRegistration {
@@ -198,6 +204,21 @@ export async function runCli(argv: readonly string[], deps: CliDeps): Promise<nu
     return reportFailure(error instanceof Error ? error.message : String(error));
   }
 
+  if (opts.command === "list-remote") {
+    try {
+      if (!deps.listRemote) throw new Error("Remote discovery is unavailable.");
+      const roster = await deps.listRemote(opts.machine ?? undefined);
+      if (opts.json) out.write(`${JSON.stringify({ ok: true, ...roster })}\n`);
+      else if (roster.machines) {
+        for (const machine of roster.machines) out.write(`${machine.label}\t${machine.enabled ? "enabled" : "disabled"}\t${machine.target}\n`);
+        out.write("Use list-remote --machine <label> to discover broker aliases.\n");
+      } else {
+        for (const agent of roster.agents ?? []) out.write(`${agent.name}@${roster.machine!.label}\t${agent.status ?? "unknown"}\t${agent.cwd ?? "unknown"}\n`);
+      }
+      return 0;
+    } catch (error) { return reportFailure((error as Error).message); }
+  }
+
   const registrationName = relayEnvelope ? relaySenderName(relayEnvelope.origin) : opts.name;
   try {
     await deps.client.connect(buildCliRegistration(registrationName, Date.now(), Boolean(relayEnvelope)));
@@ -208,9 +229,9 @@ export async function runCli(argv: readonly string[], deps: CliDeps): Promise<nu
 
   try {
     if (opts.command === "list") {
-      const sessions = await deps.client.listSessions();
+      const sessions = (await deps.client.listSessions()).filter(session => session.id !== deps.client.sessionId);
       if (opts.json) {
-        out.write(`${JSON.stringify({ ok: true, sessions: sessions.map(sessionRow) }, null, 2)}\n`);
+        out.write(`${JSON.stringify({ ok: true, version: 1, sessions: sessions.map(sessionRow) }, null, 2)}\n`);
       } else {
         for (const session of sessions) {
           const row = sessionRow(session);
@@ -242,9 +263,11 @@ export async function runCli(argv: readonly string[], deps: CliDeps): Promise<nu
         if (!deps.crossMachineSend) return reportFailure("cross-machine delivery is unavailable");
         try {
           const sessions = await deps.client.listSessions();
-          const remote = await deps.crossMachineSend(opts.to as string, opts.text as string, resolveOrigin(sessions, opts.name, deps.machineName ?? "localhost", deps.client.sessionId));
-          if (opts.json) out.write(`${JSON.stringify({ ok: true, delivered: true, crossMachine: true, machine: remote.machine.label, target: remote.agent.name })}\n`);
-          else out.write(`delivered to ${relaySenderName({ name: remote.agent.name, machine: remote.machine.label })} over SSH\n`);
+          const origin = resolveOrigin(sessions, opts.name, deps.machineName ?? "localhost", deps.client.sessionId);
+          const remote = await deps.crossMachineSend(opts.to as string, opts.text as string, origin);
+          const warning = origin.sessionId === "unknown" ? "No live source session was identified; automatic cross-host return routing is unavailable. Prefer the native intercom tool." : undefined;
+          if (opts.json) out.write(`${JSON.stringify({ ok: true, delivered: true, crossMachine: true, machine: remote.machine.label, target: remote.agent.name, ...(warning ? { warning } : {}) })}\n`);
+          else out.write(`delivered to ${relaySenderName({ name: remote.agent.name, machine: remote.machine.label })} over SSH\n${warning ? `${warning}\n` : ""}`);
           return 0;
         } catch (error) {
           return reportFailure(`explicit cross-machine delivery failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -254,10 +277,13 @@ export async function runCli(argv: readonly string[], deps: CliDeps): Promise<nu
       if (!result.delivered) {
         return reportFailure(`delivery failed: ${result.reason ?? "unknown reason"}`);
       }
+      const warning = process.env.SSH_CONNECTION || process.env.SSH_TTY
+        ? "This SSH CLI sender disconnects on the destination host; replies to it stay in a destination-local mailbox, not the original host. Use native alias@machine messaging for two-way async communication."
+        : undefined;
       if (opts.json) {
-        out.write(`${JSON.stringify({ ok: true, delivered: true, id: result.id }, null, 2)}\n`);
+        out.write(`${JSON.stringify({ ok: true, delivered: true, id: result.id, ...(warning ? { warning } : {}) }, null, 2)}\n`);
       } else {
-        out.write(`delivered to ${opts.to} (${result.id})\n`);
+        out.write(`delivered to ${opts.to} (${result.id})\n${warning ? `${warning}\n` : ""}`);
       }
       return 0;
     }
@@ -339,7 +365,9 @@ export async function runMain(argv: readonly string[] = process.argv.slice(2)): 
     machineName: config.crossMachine.machineName,
     crossMachineSend: (target, text, origin) => sendCrossMachine(target, text, origin, {
       remoteCommand: config.crossMachine.remoteCommand,
+      machines: config.crossMachine.machines,
     }),
+    listRemote: (machine) => listRemotePeers(machine, config.crossMachine),
   });
 }
 

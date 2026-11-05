@@ -4,7 +4,7 @@
 
 # Pi Intercom
 
-Direct 1:1 messaging between pi sessions on the same machine. Send context, findings, or requests from one session to another — whether you're driving the conversation or letting agents coordinate.
+Direct 1:1 messaging between Pi sessions locally or across configured SSH machines. Send context, findings, or requests from one session to another — whether you're driving the conversation or letting agents coordinate.
 
 ```text
 User flow: press Alt+M or run /intercom to pick a session and send a message
@@ -411,8 +411,9 @@ The supervisor can reply with plain JSON or a fenced `json` block. If the reply 
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `action` | string | `"list"`, `"list-cwd"`, `"send"`, `"ask"`, `"handover"`, `"reply"`, `"pending"`, `"status"`, or `"cancel"` |
-| `to` | string | Target session name or ID. Without `cwd`, send/ask resolve it globally. With `cwd`, send/ask require the target to be in that directory. Also disambiguates reply. |
+| `action` | string | `"list"`, `"list-cwd"`, `"list-remote"`, `"send"`, `"ask"`, `"handover"`, `"reply"`, `"pending"`, `"status"`, or `"cancel"` |
+| `machine` | string | For `list-remote`: trusted machine label; omit to enumerate destinations without contacting them. |
+| `to` | string | Listed role/runtime alias locally or `alias@machine` remotely; full broker IDs are available for disambiguation. Without `cwd`, send/ask resolve it globally. With `cwd`, send/ask require the target to be in that directory. Also disambiguates reply. |
 | `message` | string | Message text (for send/ask/reply), or the optional next task for `handover` |
 | `attachments` | array | Optional `file`, `snippet`, or `context` attachments |
 | `replyTo` | string | Optional message ID for threading or replying to an `ask` |
@@ -449,7 +450,7 @@ Only registered in sessions where `pi-subagents` supplied the required child bri
 
 **`handover`** — Summarizes the current session with the current model and sends the summary to the target, which acts on it. `message` is the optional next task. Targeting, confirmation, and delivery work exactly like `send`, including `name@machine` targets. `replyTo`, `supersedes`, `retryOf`, and `attachments` are rejected. See [Workflow: Handing Over a Session](#workflow-handing-over-a-session).
 
-**`reply`** — Replies to the current intercom-triggered message if there is one. Otherwise it falls back to the single unresolved inbound ask. If multiple asks are pending, pass `to` or inspect them with `pending` first. Under the hood this is still a normal `send` with the exact `replyTo` value. If the ask is no longer open at the broker (it expired, was cancelled, or was already answered), the reply is still delivered as an ordinary message marked as a late reply, as long as neither session has reconnected since the ask, the broker has not restarted, and the ask was sent within the last hour. It does not complete the asker's waiting `ask`. Otherwise `reply` fails with `E_REPLY_TARGET` and says to deliver the content with `send`.
+**`reply`** — Replies to the current intercom-triggered message if there is one. Otherwise it falls back to the single unresolved inbound ask. If multiple asks are pending, pass `to` or inspect them with `pending` first. For local peers this is a normal `send` with the exact `replyTo` value. For an incoming cross-host message, `reply` instead sends a new asynchronous message pinned to the asserted origin's broker ID, never to the temporary relay CLI. Later, use `reply` with `to: "alias@machine"` while the recent origin context remains available (bounded to 64 origins and the configured ask timeout). Cross-host wire threading is not implied. If the ask is no longer open at the broker (it expired, was cancelled, or was already answered), the reply is still delivered as an ordinary message marked as a late reply, as long as neither session has reconnected since the ask, the broker has not restarted, and the ask was sent within the last hour. It does not complete the asker's waiting `ask`. Otherwise `reply` fails with `E_REPLY_TARGET` and says to deliver the content with `send`.
 
 **`pending`** — Lists unresolved inbound asks with sender, message ID, elapsed time, and a short preview. Useful when replying after the original triggered turn.
 
@@ -499,7 +500,8 @@ Create `~/.pi/agent/intercom/config.json`:
 | `replyHint` | true | Include reply instruction in incoming messages |
 | `status` | — | Optional custom status suffix shown after the automatic lifecycle status, for example `thinking · researching` |
 | `crossMachine.machineName` | lowercased short hostname | Name peers use for this host in their Herdr saved-machine lists |
-| `crossMachine.remoteCommand` | `"pi-intercom"` | Command invoked through non-interactive SSH on remote machines |
+| `crossMachine.remoteCommand` | `"pi-intercom"` | Trusted default command invoked through non-interactive SSH on remote machines |
+| `crossMachine.machines` | unset | Trusted labels mapped to `{ target?, remoteCommand?, enabled? }`; target adds a destination without Herdr, remoteCommand overrides that host’s install path. A disabled Herdr entry stays disabled. |
 
 If `config.json` cannot be parsed or contains an invalid value, pi-intercom logs the error and fails closed for inbound broker auto-triggering by using `inboundTrigger: "never"` until the config is fixed.
 Obsolete `toolVisibility` values are ignored; the generic `intercom` tool remains stable in the active tool set for prompt-cache friendliness.
@@ -625,19 +627,54 @@ pi-intercom list --json
 
 Flags: `--to <name|session-id>`, `--text`, `--name <session-name>` (roster name, default `pi-intercom-cli`), `--timeout-ms` (ask only, default 120000), `--no-wake` (send to a local session only), `--json`. Exit codes: `0` success, `1` usage/connection/delivery failure, `2` ask timeout. With `--json`, every command prints one object with an `ok` field: `list` returns `{ ok: true, sessions: [...] }`, and failures return `ok: false` with `error` (plus `reason: "timeout"` on timeout).
 
-### Cross-machine coordination over ssh
+### Cross-machine coordination over SSH
 
-Because the CLI runs *on the machine that owns the broker*, you can bridge sessions across machines through ssh without opening any network listener — the remote broker stays exactly as local-only as before:
+Discover first, use a listed alias, and respond with the provided reply instruction:
 
-```bash
-ssh remote-host 'pi-intercom ask --to worker --text "done with the migration?"'
+```typescript
+intercom({ action: "list-remote" }) // trusted machines; no remote connections
+intercom({ action: "list-remote", machine: "macbook" }) // aliases, cwd, status
+intercom({ action: "send", to: "arm-worker@macbook", message: "Collect results and send them when ready." })
+// Recipient: a new async message to the original source, not the relay CLI.
+intercom({ action: "reply", message: "Here are the results." })
 ```
 
-For native cross-machine `send`, address the session as `reviewer@workstation` (or a full session UUID followed by `@workstation`). pi-intercom finds the session on that machine and relays the message through SSH while every broker remains local-only. Herdr is optional. If `workstation` is an enabled saved Herdr machine, its Herdr agent list is checked first and its saved SSH target is used. Otherwise, or if Herdr is not installed, `workstation` is used as an SSH host name (`~/.ssh/config` aliases work). Sessions that Herdr does not list are found by running `<crossMachine.remoteCommand> list --json` (default `pi-intercom list --json`) on the machine. Those SSH connections run in batch mode, so they need key or agent authentication and a known host key; a password or host-key prompt fails instead of waiting. Ordinary local targets never fall back to remote discovery, and disabled Herdr machines and malformed addresses fail closed.
+Ordinary `list` and `list-cwd` are local/pool-scoped. Remote discovery always queries the selected machine's **intercom broker roster** through `pi-intercom list --json`. Herdr selects trusted machines, not session identities: pane labels, terminal titles, cwd basenames and Pi session-file UUIDs are not intercom aliases. Runtime aliases and custom stable broker IDs work even outside Herdr. Duplicate aliases fail closed with candidates; full broker IDs remain available for explicit disambiguation.
 
-The relay carries structured SSH-asserted origin metadata. Incoming headers render `From worker@laptop · unverified cross-machine` and provide a new-message `send` hint to that address. This identity is not cryptographically verified: anyone with SSH access that can invoke the relay can claim it. Cross-machine `ask`, `replyTo`, attachments, supersede, retry, `noWake`, cwd/project-pane routing, and lifecycle actions are not supported in v1.
+Configure enabled saved Herdr machines, or add trusted destinations directly. Unknown labels never become guessed SSH hosts. Use per-machine commands for differing installation paths:
 
-Discovery and delivery are bounded by five-second and fifteen-second timeouts respectively. Remote hosts must provide a compatible `pi-intercom relay` command. Non-interactive SSH often has a minimal `PATH`; set the trusted global `crossMachine.remoteCommand` to an absolute command when needed. Unknown relay versions and non-JSON responses produce an upgrade error.
+```json
+{
+  "crossMachine": {
+    "machineName": "wsl",
+    "remoteCommand": "pi-intercom",
+    "machines": {
+      "macbook": {
+        "target": "user@macbook",
+        "remoteCommand": "/absolute/node /absolute/pi-intercom/cli.mjs"
+      }
+    }
+  }
+}
+```
+
+On the Mac, configure `machineName: "macbook"` and a reverse `wsl` destination with the WSL SSH target and its command. A reverse label must resolve locally on the replying machine; origin metadata cannot create trusted destinations. SSH runs in batch mode with a bounded connection timeout and normal host-key verification. A password or unknown-host-key prompt fails with a diagnostic; establish trust interactively yourself rather than disabling checks.
+
+CLI discovery is also explicit:
+
+```sh
+pi-intercom list-remote
+pi-intercom list-remote --machine macbook --json
+pi-intercom send --to arm-worker@macbook --text "Collect results"
+```
+
+A native send preserves the source's actual broker identity and display alias. `reply` in the triggered turn, or later `reply` with `to: "source-alias@machine"`, uses that identity internally even if the alias changes. Missing or stale source identities fail rather than falling back to another peer with a matching name. After the context expires, discover again and send a new message to a listed alias. Each remote CLI connects to its configured broker/pool; discovery does not bypass pool isolation.
+
+**Plain SSH CLI sends are different.** `ssh host 'pi-intercom send --to worker --name bridge --text ...'` creates a transient sender on that destination broker. It disconnects when the command exits; subsequent replies to it stay in a destination-local mailbox, not the original host. The CLI warns about this when run through SSH. Prefer native `alias@machine` messaging for async two-way communication. Standalone native CLI sends without an identifiable live source also warn that automatic return routing is unavailable.
+
+Incoming headers retain `unverified cross-machine` and structured SSH-asserted origin metadata. Anyone able to invoke the relay over SSH can assert an origin; this is not authenticated Pi identity. Cross-host `ask`, wire `replyTo`, attachments, supersede/retry, `noWake`, and cwd/project/lifecycle routing are unsupported. Origin-aware `reply` is a new text send, not a blocking or threaded exchange.
+
+Discovery and delivery are bounded by five-second and fifteen-second command deadlines. Both discovery and delivery use the same trusted per-machine command. SSH authentication/host-key failures, missing commands and timeouts retain their diagnostics instead of claiming every failure needs an upgrade. A post-send transport failure can leave delivery **unknown**: check the result and make retries explicit.
 
 ## How It Works
 
@@ -740,7 +777,7 @@ Use pi-messenger for multi-agent swarms working on a shared task. Use pi-interco
 
 ## Limitations
 
-- **Same machine only** — Uses local sockets/pipes, no network support
+- **Local-only brokers** — Brokers listen on local sockets/pipes; configured cross-host messaging uses SSH, not a public broker listener.
 - **No dedicated intercom log** — Messages are kept in Pi session history, but there is no separate intercom transcript or inbox
 - **No attachments UI** — `file`, `snippet`, and `context` attachments are supported in the protocol, but not in the compose overlay
 - **Only connected sessions appear** — The list shows Pi sessions that have loaded `pi-intercom` and successfully registered with the broker, not every open Pi process on the machine

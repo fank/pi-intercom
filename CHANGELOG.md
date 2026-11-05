@@ -2,10 +2,21 @@
 
 All notable changes to the `pi-intercom` extension will be documented in this file.
 
+## [0.18.2-fank.1]
+
+### Added
+- Explicit tool/CLI `list-remote` discovery exposes real broker aliases, cwd and status. Trusted per-machine destinations and command overrides support differing Mac/Linux installation paths.
+- Cross-host `reply` sends a new asynchronous message to the original broker identity internally, rather than a transient CLI mailbox.
+
+### Fixed
+- Remote routing no longer mistakes Herdr pane names or session-file UUIDs for broker identities. Duplicate aliases, stale return identities, unknown/disabled destinations and ambiguous machine labels fail closed with actionable candidates.
+- SSH diagnostics and unknown delivery outcomes remain visible. Plain SSH CLI sends warn that their reply mailbox is destination-local.
+- Tool descriptions, skill and README now agree on local versus remote discovery and the discover → alias → respond procedure.
+
 ## [Unreleased]
 
 ### Added
-- Sending to `name@machine` no longer requires Herdr. pi-intercom connects to the machine over SSH by that host name (including `~/.ssh/config` aliases), finds the session in that machine's intercom roster, and delivers the message there. This also reaches Pi sessions that run outside a Herdr pane on a machine saved in Herdr. The SSH connection must work without a password or host-key prompt. Thanks to [@mblarsen](https://github.com/mblarsen) for issue #194.
+- Sending to `name@machine` can reach broker peers outside Herdr panes. In this fork, destinations without Herdr are explicitly configured in `crossMachine.machines` rather than inferred from unknown labels. SSH must work without a password or host-key prompt. Thanks to [@mblarsen](https://github.com/mblarsen) for issue #194.
 - Extension channels have `unregister()`. A session can leave a namespace it registered, which frees one of its 32 extension slots and, if it owned the namespace, hands ownership to the next owner-eligible member. Thanks to [@wayne930242](https://github.com/wayne930242) for #184.
 - A sender can mark a message as information only. With `noWake: true` on `send` (or `pi-intercom send --no-wake`), an idle session gets the message without starting a new turn and reads it the next time it runs, so a "no reply needed" update no longer costs the receiver a full model request. Asks and replies always wake the receiver. Thanks to [@erikdarlingdata](https://github.com/erikdarlingdata) for issue #195.
 

@@ -196,7 +196,7 @@ test("runCli send reports delivery", async () => {
   const err = new MemorySink();
   const code = await runCli(["send", "--to", "worker", "--text", "build failed"], { client, out, err });
   assert.equal(code, 0);
-  assert.match(out.text(), /^delivered to worker \(sent-1\)\n$/);
+  assert.match(out.text(), /^delivered to worker \(sent-1\)\n/);
   assert.deepEqual(client.sends, [{ to: "worker", text: "build failed", expectsReply: undefined }]);
 });
 
@@ -266,7 +266,7 @@ test("runCli and discovery share the explicit remote address corpus", async () =
   }
 
   for (const target of ["@workstation", "reviewer@", "reviewer@@workstation", " reviewer@workstation", "reviewer@workstation ", "review er@workstation", "reviewer@work\tstation"]) {
-    assert.throws(() => parseCrossMachineTarget(target), /expected name@machine or full-session-uuid@machine/);
+    assert.throws(() => parseCrossMachineTarget(target), /expected alias@machine or full-session-id@machine/);
     const client = new FakeClient();
     const code = await runCli(["send", "--to", target, "--text", "hello"], { client, out: new MemorySink(), err: new MemorySink() });
     assert.equal(code, 1);

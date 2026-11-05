@@ -87,6 +87,13 @@ export function relaySenderName(origin: Pick<CrossMachineOrigin, "name" | "machi
   return `${origin.name}@${origin.machine}`;
 }
 
+export function crossMachineReplyTarget(origin: CrossMachineOrigin): string {
+  if (origin.sessionId === "unknown" || [origin.sessionId, origin.machine].some(value => !value || /[@\s\x00-\x1f\x7f]/.test(value))) {
+    throw new Error("This cross-machine message has no usable live-source return identity. Run list-remote for the source machine and send to a listed alias; do not reply to the transient relay CLI.");
+  }
+  return `${origin.sessionId}@${origin.machine}`;
+}
+
 export function relayMessage(envelope: CrossMachineEnvelope): string {
   return `[Unverified cross-machine origin]\n${envelope.text}`;
 }

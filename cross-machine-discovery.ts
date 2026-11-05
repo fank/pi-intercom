@@ -1,26 +1,27 @@
-const FULL_SESSION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const SESSION_ID_IN_PATH = /_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i;
+import type { CrossMachineHostConfig } from "./config.ts";
+
 export const DISCOVERY_TIMEOUT_MS = 5_000;
+// Preserve normal SSH host-key verification; prompts must not take over Pi's terminal.
+export const DIRECT_SSH_OPTIONS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"];
 
 export interface SavedMachine {
   label: string;
   target: string;
   enabled: boolean;
+  remoteCommand?: string;
 }
 
 export interface RemoteAgent {
   name: string;
+  /** Actual intercom broker identity, not a Herdr session-file UUID. */
   sessionId?: string;
   cwd?: string;
-  /** Herdr agent_status, e.g. "idle" or "working". */
   status?: string;
 }
 
 export interface DiscoveredRemoteAgent {
   machine: SavedMachine;
   agent: RemoteAgent;
-  /** Found in the machine's intercom roster over SSH rather than in Herdr. */
-  viaSsh?: boolean;
 }
 
 export interface DiscoveryDeps {
@@ -31,169 +32,141 @@ export interface DiscoveryDeps {
     timedOut?: boolean;
   }>;
   herdrBin: string;
+  remoteCommand?: string;
+  machines?: Record<string, CrossMachineHostConfig>;
+  /** Internal origin-pinned replies must never fall back to a matching alias. */
+  exactSessionId?: boolean;
   discoveryTimeoutMs?: number;
 }
-
-// A password or host-key prompt must fail instead of taking over Pi's terminal.
-export const DIRECT_SSH_OPTIONS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"];
-// The agent supplies this host, so it must not start with "-" (ssh would read it as an option).
-const SSH_HOST = /^[A-Za-z0-9_.][A-Za-z0-9_.-]*$/;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function parseJsonOutput(raw: string, operation: string): unknown {
-  try {
-    const parsed = JSON.parse(raw);
-    if (isRecord(parsed) && "result" in parsed) return parsed.result;
-    return parsed;
-  } catch {
-    throw new Error(`${operation} returned invalid JSON.`);
-  }
+export function validateRemoteCommand(command: string): string {
+  if (!command.trim()) throw new Error("Remote command must not be empty.");
+  if (/[\x00-\x1f\x7f]/.test(command)) throw new Error("Remote command must not contain ASCII control characters.");
+  return command;
 }
 
 export function parseSavedMachines(raw: string): SavedMachine[] {
-  const value = parseJsonOutput(raw, "herdr machine list");
-  const rows = Array.isArray(value) ? value : isRecord(value) && Array.isArray(value.machines) ? value.machines : [];
-  return rows.flatMap((row): SavedMachine[] => {
-    if (!isRecord(row) || typeof row.label !== "string" || typeof row.target !== "string") return [];
-    return [{ label: row.label, target: row.target, enabled: row.enabled !== false }];
-  });
-}
-
-export function parseRemoteAgents(raw: string): RemoteAgent[] {
-  const value = parseJsonOutput(raw, "herdr agent list");
-  const rows = isRecord(value) && Array.isArray(value.agents) ? value.agents : [];
-  return rows.flatMap((row): RemoteAgent[] => {
-    if (!isRecord(row) || row.agent !== "pi") return [];
-    const agentSession = isRecord(row.agent_session) ? row.agent_session : undefined;
-    const sessionPath = agentSession?.kind === "path" && typeof agentSession.value === "string" ? agentSession.value : undefined;
-    const sessionId = sessionPath?.match(SESSION_ID_IN_PATH)?.[1];
-    // Herdr only reports a name for renamed panes; an unnamed Pi session is addressed by its session id.
-    const name = typeof row.name === "string" && row.name ? row.name : sessionId;
-    if (!name) return [];
-    return [{
-      name,
-      ...(sessionId ? { sessionId } : {}),
-      ...(typeof row.cwd === "string" ? { cwd: row.cwd } : {}),
-      ...(typeof row.agent_status === "string" ? { status: row.agent_status } : {}),
-    }];
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    throw new Error("herdr machine list returned invalid JSON.");
+  }
+  if (isRecord(value) && "result" in value) value = value.result;
+  const rows = Array.isArray(value) ? value : isRecord(value) && Array.isArray(value.machines) ? value.machines : undefined;
+  if (!rows) throw new Error("herdr machine list returned an unsupported machine roster.");
+  return rows.map((row): SavedMachine => {
+    if (!isRecord(row) || typeof row.label !== "string" || !row.label || typeof row.target !== "string" || !row.target
+      || (row.enabled !== undefined && typeof row.enabled !== "boolean")) {
+      throw new Error("herdr machine list returned an invalid saved machine.");
+    }
+    return { label: row.label, target: row.target, enabled: row.enabled !== false };
   });
 }
 
 export function parseCrossMachineTarget(target: string): { agentTarget: string; machineLabel: string } {
   const parts = target.split("@");
-  if (parts.length !== 2 || parts.some((part) => !part || /\s/.test(part))) {
-    throw new Error(`Invalid remote target "${target}"; expected name@machine or full-session-uuid@machine.`);
+  if (parts.length !== 2 || parts.some((part) => !part || /[\s\x00-\x1f\x7f]/.test(part))) {
+    throw new Error(`Invalid remote target "${target}"; expected alias@machine or full-session-id@machine. Run list-remote first.`);
   }
-  return { agentTarget: parts[0], machineLabel: parts[1] };
+  return { agentTarget: parts[0]!, machineLabel: parts[1]! };
 }
 
+/** List trusted destinations, without contacting any remote host. */
 export async function listSavedMachines(deps: DiscoveryDeps): Promise<SavedMachine[]> {
-  const listed = await deps.run(deps.herdrBin, ["machine", "list", "--json"], undefined, deps.discoveryTimeoutMs ?? DISCOVERY_TIMEOUT_MS);
-  if (listed.code !== 0) throw new Error(`Could not list Herdr saved machines: ${listed.timedOut ? "timed out" : listed.stderr.trim() || `exit ${listed.code}`}`);
-  return parseSavedMachines(listed.stdout);
+  let machines: SavedMachine[];
+  try {
+    const listed = await deps.run(deps.herdrBin, ["machine", "list", "--json"], undefined, deps.discoveryTimeoutMs ?? DISCOVERY_TIMEOUT_MS);
+    if (listed.code !== 0) throw new Error(`Could not list Herdr saved machines: ${listed.timedOut ? "timed out" : listed.stderr.trim() || `exit ${listed.code}`}`);
+    machines = parseSavedMachines(listed.stdout);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    machines = [];
+  }
+  for (const [label, settings] of Object.entries(deps.machines ?? {})) {
+    const matches = machines.filter(machine => machine.label.toLowerCase() === label.toLowerCase());
+    if (matches.length > 1) throw new Error(`Saved Herdr machine label "${label}" is ambiguous.`);
+    const existing = matches[0];
+    if (existing) {
+      // A disabled Herdr entry cannot be re-enabled implicitly by an override.
+      existing.enabled = existing.enabled && settings.enabled !== false;
+      if (settings.target) existing.target = settings.target;
+      if (settings.remoteCommand) existing.remoteCommand = settings.remoteCommand;
+    } else if (settings.target) {
+      machines.push({ label, target: settings.target, enabled: settings.enabled !== false, ...(settings.remoteCommand ? { remoteCommand: settings.remoteCommand } : {}) });
+    }
+  }
+  return machines;
+}
+
+export async function resolveRemoteMachine(label: string, deps: DiscoveryDeps): Promise<SavedMachine> {
+  const selected = (await listSavedMachines(deps)).filter(machine => machine.label.toLowerCase() === label.toLowerCase());
+  if (selected.length > 1) throw new Error(`Saved Herdr machine label "${label}" is ambiguous; expected exactly one machine.`);
+  const machine = selected[0];
+  if (!machine || !machine.enabled) {
+    throw new Error(`Remote machine "${label}" is unknown or disabled. Run intercom({ action: "list-remote" }) to see configured machines; configure a Herdr saved machine or crossMachine.machines before sending.`);
+  }
+  if (/^[\s-]|[\x00-\x20\x7f]/.test(machine.target)) throw new Error(`Remote machine "${label}" has an unsafe SSH target.`);
+  return machine;
+}
+
+/** Accept the existing list --json protocol, including older destination CLIs. */
+export function parseBrokerAgents(raw: string): RemoteAgent[] {
+  let value: unknown;
+  try { value = JSON.parse(raw); } catch { throw new Error("Remote intercom list returned invalid JSON; check the remote command and upgrade pi-intercom if needed."); }
+  if (!isRecord(value) || value.ok !== true || !Array.isArray(value.sessions)) {
+    throw new Error(isRecord(value) && typeof value.error === "string" ? value.error : "Remote intercom list returned an unsupported broker roster.");
+  }
+  return value.sessions.flatMap((row): RemoteAgent[] => {
+    if (!isRecord(row) || typeof row.id !== "string" || !row.id || typeof row.model !== "string") throw new Error("Remote intercom list returned an invalid session.");
+    if (row.model === "pi-intercom-cli") return [];
+    return [{
+      name: typeof row.name === "string" && row.name && row.name !== "(unnamed)" ? row.name : row.id,
+      sessionId: row.id,
+      ...(typeof row.cwd === "string" ? { cwd: row.cwd } : {}),
+      ...(typeof row.status === "string" ? { status: row.status } : {}),
+    }];
+  });
+}
+
+export function remoteCommandFor(machine: SavedMachine, deps: DiscoveryDeps): string {
+  return validateRemoteCommand(machine.remoteCommand ?? deps.remoteCommand ?? "pi-intercom");
 }
 
 export async function listMachineAgents(machine: SavedMachine, deps: DiscoveryDeps): Promise<RemoteAgent[]> {
-  const result = await deps.run(deps.herdrBin, ["--machine", machine.label, "agent", "list"], undefined, deps.discoveryTimeoutMs ?? DISCOVERY_TIMEOUT_MS);
-  if (result.code !== 0) {
-    // Herdr prints Rust debug errors: Error: Custom { kind: …, error: "machine 'x': reason" }.
-    const herdrError = result.stderr.match(/error: "((?:[^"\\]|\\.)*)"/)?.[1]?.replace(/\\(.)/g, "$1").replace(/^machine '[^']*': /, "");
-    const detail = result.timedOut ? "timed out" : herdrError ?? (result.stderr.trim() || `exit ${result.code}`);
-    const hint = /does not support machine API forwarding/.test(detail)
-      ? ` Its running Herdr server is too old; update Herdr there, then run \`herdr --remote ${machine.target}\` in a terminal to replace the server.`
-      : "";
-    throw new Error(`Saved Herdr machine "${machine.label}" is unreachable: ${detail.replace(/\.$/, "")}.${hint}`);
+  if (!machine.enabled) throw new Error(`Remote machine "${machine.label}" is disabled.`);
+  if (/^[\s-]|[\x00-\x20\x7f]/.test(machine.target)) throw new Error(`Remote machine "${machine.label}" has an unsafe SSH target.`);
+  const command = remoteCommandFor(machine, deps);
+  const result = await deps.run("ssh", [...DIRECT_SSH_OPTIONS, machine.target, `${command} list --json`], undefined, deps.discoveryTimeoutMs ?? DISCOVERY_TIMEOUT_MS);
+  if (result.code !== 0 || result.timedOut) {
+    const detail = result.timedOut ? "timed out" : result.stderr.trim().slice(0, 1000) || `exit ${result.code}`;
+    throw new Error(`Could not list intercom sessions on "${machine.label}" over SSH: ${detail}. Check SSH connectivity/host keys and crossMachine remoteCommand; no message was sent.`);
   }
-  try {
-    return parseRemoteAgents(result.stdout);
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : "invalid response";
-    throw new Error(`Saved Herdr machine "${machine.label}" is unreachable: ${detail}`);
+  try { return parseBrokerAgents(result.stdout); } catch (error) {
+    throw new Error(`Could not list intercom sessions on "${machine.label}": ${(error as Error).message}`);
   }
 }
 
-async function listSshAgents(host: string, deps: DiscoveryDeps & { remoteCommand: string }): Promise<RemoteAgent[]> {
-  const result = await deps.run("ssh", [...DIRECT_SSH_OPTIONS, host, `${deps.remoteCommand} list --json`], undefined, deps.discoveryTimeoutMs ?? DISCOVERY_TIMEOUT_MS);
-  let listed: unknown;
-  try {
-    listed = JSON.parse(result.stdout);
-  } catch {
-    listed = undefined;
-  }
-  if (result.code === 0 && isRecord(listed) && listed.ok === true && Array.isArray(listed.sessions)) {
-    return listed.sessions.flatMap((row: unknown): RemoteAgent[] => {
-      // The listing CLI registers itself; CLI bridges are not Pi sessions.
-      if (!isRecord(row) || typeof row.id !== "string" || row.model === "pi-intercom-cli") return [];
-      return [{
-        name: typeof row.name === "string" && row.name && row.name !== "(unnamed)" ? row.name : row.id,
-        sessionId: row.id,
-      }];
-    });
-  }
-  if (isRecord(listed) && listed.ok === false && typeof listed.error === "string") {
-    throw new Error(`\`${deps.remoteCommand} list\` on "${host}" failed: ${listed.error.replace(/\s+/g, " ").trim()}`);
-  }
-  const detail = result.timedOut ? "timed out" : result.stderr.trim() || `exit ${result.code}`;
-  throw new Error(
-    `Could not list intercom sessions on "${host}" over SSH: ${detail.replace(/\.$/, "")}. Check that \`ssh ${host}\` connects without a password or host-key prompt`
-      + ` and that \`${deps.remoteCommand} list\` runs there (set crossMachine.remoteCommand to an absolute path if SSH's PATH lacks it).`,
-  );
+export function remoteCandidates(agents: RemoteAgent[], machine: string): string {
+  if (agents.length === 0) return "No live broker peers in the destination pool.";
+  return agents.slice(0, 8).map(agent => `${JSON.stringify(`${agent.name}@${machine}`)} (${agent.status ?? "unknown"}, cwd ${JSON.stringify(agent.cwd ?? "unknown")}, full ID ${JSON.stringify(agent.sessionId)})`).join("; ")
+    + (agents.length > 8 ? "; … run list-remote for more" : "");
 }
 
-function findAgent(agents: RemoteAgent[], explicit: ReturnType<typeof parseCrossMachineTarget>, where: string): RemoteAgent | undefined {
-  const bySessionId = FULL_SESSION_UUID.test(explicit.agentTarget);
-  const matches = agents.filter((agent) => bySessionId
-    ? agent.sessionId === explicit.agentTarget
-    : agent.name.toLowerCase() === explicit.agentTarget.toLowerCase());
-  if (matches.length > 1) {
-    throw new Error(`Multiple live Pi agents on ${where} exactly match "${explicit.agentTarget}"; target is ambiguous. Address it as \`<session-id>@${explicit.machineLabel}\`.`);
-  }
-  return matches[0];
-}
-
-export async function discoverRemoteAgent(
-  target: string,
-  deps: DiscoveryDeps & { remoteCommand: string },
-): Promise<DiscoveredRemoteAgent> {
+export async function discoverRemoteAgent(target: string, deps: DiscoveryDeps): Promise<DiscoveredRemoteAgent> {
   const explicit = parseCrossMachineTarget(target);
-  // Herdr is optional: without it, the machine label is used as an SSH host.
-  const saved = (await listSavedMachines(deps).catch((error: NodeJS.ErrnoException) => {
-    if (error.code === "ENOENT") return [];
-    throw error;
-  })).filter((machine) => machine.label.toLowerCase() === explicit.machineLabel.toLowerCase());
-  const selected = saved.filter((machine) => machine.enabled);
-  if (selected.length > 1) {
-    throw new Error(`Saved Herdr machine label "${explicit.machineLabel}" is ambiguous; expected exactly one enabled machine.`);
+  const machine = await resolveRemoteMachine(explicit.machineLabel, deps);
+  const agents = await listMachineAgents(machine, deps);
+  // Full broker IDs take precedence, including non-UUID stable IDs. Never route by a pane label.
+  const byId = agents.filter(agent => agent.sessionId === explicit.agentTarget);
+  const matches = byId.length || deps.exactSessionId ? byId : agents.filter(agent => agent.name.toLowerCase() === explicit.agentTarget.toLowerCase());
+  if (matches.length !== 1) {
+    const reason = matches.length ? "Multiple live broker peers match; target is ambiguous" : "No live broker peer exactly matches";
+    throw new Error(`${reason} ${JSON.stringify(target)}. Candidates: ${remoteCandidates(matches.length ? matches : agents, machine.label)}. Run intercom({ action: "list-remote", machine: ${JSON.stringify(machine.label)} }); use a listed alias (or a full broker ID to disambiguate).`);
   }
-  if (selected.length === 1) {
-    const machine = selected[0]!;
-    const where = `saved Herdr machine "${machine.label}"`;
-    const herdrAgent = findAgent(await listMachineAgents(machine, deps), explicit, where);
-    if (herdrAgent) return { machine, agent: herdrAgent };
-    // A Pi session outside a Herdr pane is only in the machine's intercom roster.
-    const sshAgents = await listSshAgents(machine.target, deps).catch((error: Error) => {
-      throw new Error(`No live Pi agent on ${where} exactly matches "${explicit.agentTarget}" in \`herdr agent list\`. ${error.message}`);
-    });
-    const agent = findAgent(sshAgents, explicit, where);
-    if (!agent) {
-      throw new Error(`No live Pi agent on ${where} exactly matches "${explicit.agentTarget}" in \`herdr agent list\` or \`${deps.remoteCommand} list\`.`);
-    }
-    return { machine, agent, viaSsh: true };
-  }
-  if (saved.length > 0) {
-    throw new Error(`Saved Herdr machine "${explicit.machineLabel}" is disabled; enable it in Herdr to send there.`);
-  }
-
-  const host = explicit.machineLabel;
-  if (!SSH_HOST.test(host)) {
-    throw new Error(`"${host}" is not a saved Herdr machine or a plain SSH host name (letters, digits, ".", "_", "-").`);
-  }
-  const agent = findAgent(await listSshAgents(host, deps), explicit, `"${host}"`);
-  if (!agent) {
-    throw new Error(`No live Pi agent on "${host}" exactly matches "${explicit.agentTarget}". Run \`${deps.remoteCommand} list\` there to see session names.`);
-  }
-  return { machine: { label: host, target: host, enabled: true }, agent, viaSsh: true };
+  return { machine, agent: matches[0]! };
 }

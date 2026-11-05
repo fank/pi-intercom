@@ -1,65 +1,88 @@
 ---
 name: pi-intercom
 description: |
-  Coordinate with other Pi sessions through the intercom tool: message, ask or
-  hand over to a peer in this repo, another repo or another machine; answer asks
-  waiting on you; and handle escalations from pi-subagents children. Use for
-  planner-worker setups and cross-session handoffs.
+  Discover and communicate with Pi peers locally or across configured SSH machines.
+  Use for cross-session handoffs, asynchronous collection requests, replies, and
+  pi-subagents supervisor escalations.
 ---
 
 # Pi Intercom
 
-The `intercom` tool description lists each action's call shape. This skill adds the rules agents get wrong.
+## Discover → address → respond
 
-## Cheat sheet
+1. **Discover the right roster.** `list-cwd` shows peers in your directory; `list`
+   shows your local broker pool. For another host, `list-remote` shows trusted
+   machines without connecting, then `list-remote` with `machine` lists that
+   machine's actual broker aliases, cwd and status.
+2. **Use a listed role/runtime alias.** Send to `worker` locally or
+   `worker@macbook` remotely. Pane names, terminal titles and repo names are not
+   addresses. If a target is missing or ambiguous, re-list and use the candidates;
+   no machine or peer is selected automatically.
+3. **Send asynchronously for long work.** Use `send` for collection requests and
+   handoffs. `ask` blocks, has a timeout, and only works locally.
+4. **Respond using `reply`.** In the incoming message's turn, pass only `message`.
+   For a later cross-host response, pass `to: "worker@macbook"` from its header.
+   Intercom retains recent remote origins and routes to the original broker ID
+   internally, not the transient relay CLI. A cross-host reply is a new async
+   message, not a blocking/threaded reply. If its context expired, discover again
+   and use `send` to a listed alias.
 
-```text
-intercom({ action: "list-cwd", cwd?: "/repo" })   # peers in a directory (default: yours); "list" shows every peer
-intercom({ action: "send", to, message })          # fire-and-forget, returns at once
-intercom({ action: "ask", to, message })           # waits for the reply
-intercom({ action: "pending" })                    # asks waiting on you: sender, message id, age, preview
-intercom({ action: "reply", message, to? })        # answers an ask; `to` picks one when several wait
+```typescript
+intercom({ action: "list-cwd" })
+intercom({ action: "list-remote" })
+intercom({ action: "list-remote", machine: "macbook" })
+intercom({ action: "send", to: "arm-worker@macbook", message: "Collect ARM results and send them when ready." })
+// On the recipient:
+intercom({ action: "reply", message: "Here are the ARM results…" })
 ```
 
-## Targeting
+## Cross-host constraints
 
-- `to` plus `cwd` uses the directory as a guard.
-- `name@machine` or `<session-id>@machine` reaches a session on another machine: a saved Herdr machine, or any host `ssh machine` reaches without a prompt. Only `send` and `handover` work across machines: no `ask`, `replyTo`, attachments or `cwd`.
-- Address sessions by name or id. Herdr pane ids in `list` show location only.
+- Remote destinations must be enabled Herdr saved machines or trusted
+  `crossMachine.machines` entries. SSH needs noninteractive authentication and
+  known host keys. Per-machine command overrides handle different install paths.
+- The destination roster is its CLI's broker pool, not every pool on that host.
+  Use matching trusted runtime configuration for discovery and relay.
+- `send`, `handover`, and origin-aware async `reply` work across hosts.
+  Cross-host `ask`, `replyTo`, attachments, supersede/retry, `noWake`, and cwd/project
+  routing are unsupported.
+- A plain `ssh host 'pi-intercom send … --name bridge'` creates a destination-local
+  CLI sender which disconnects. Replies to that bridge stay on that host; it is
+  not a transparent two-way bridge. Prefer the native tool with `alias@machine`.
+- Each host needs a configured reverse machine label to send a response. Missing
+  reverse mappings or source identities produce actionable errors, not a local
+  mailbox fallback. Check both sides when setting up a machine.
+- “Unverified cross-machine” identifies SSH-asserted metadata, not an authenticated
+  Pi session. Delivery timeouts can have unknown outcomes; retries are explicit.
 
-## Asking and replying
+## Local asks and replies
 
-- **Ask needs a live peer.** `ask` to a session not in `list` fails at once. Use `send` instead: for a session that disconnected in the last 24 hours, the broker holds the message until it reconnects (same session id, or the same explicit name and directory).
-- **One ask at a time.** A second `ask` while one waits fails with "Already waiting for a reply"; use `send`.
-- **Ask timeout** is 10 minutes by default (`PI_INTERCOM_ASK_TIMEOUT_MS`). For longer work, `send` the task and `ask` only at decision points.
-- **Reply** in the turn the ask arrived with just `message`. Later, or when several asks wait, run `pending` and pass `to` (or `replyTo` with the message id).
-- **`send` can answer.** When exactly one unanswered ask from the target is waiting on you, `send` goes out as the reply to it.
-- **Late replies** after the ask closed arrive as a plain message marked late and don't end the asker's wait.
+- `ask` needs a live peer and only one ask can wait per session. The default tool
+  timeout is 10 minutes (`PI_INTERCOM_ASK_TIMEOUT_MS`); use async `send` for long work.
+- `pending` lists local asks waiting on you. With several asks, `reply` with `to`
+  selects a sender; `replyTo` selects an exact local ask.
+- `send` answers the sole pending ask from its target when unambiguous. Late local
+  replies can arrive as ordinary messages and do not complete the original wait.
+- Local disconnected named sessions have a bounded mailbox, not permanent storage.
 
 ## Supervising pi-subagents
 
-A child started by `pi-subagents` reaches its supervisor through `contact_supervisor`. Its messages start with "Subagent needs a supervisor decision.", "Subagent requests a structured supervisor interview." or "Subagent progress update."
-
-- **Decision:** the child is blocked until you `reply`. To ask it something first, put the question in that `reply`; an `ask` to a child waiting on you is refused.
-- **Interview:** `reply` with the JSON the message asks for.
-- **Progress update:** no reply needed. To redirect the child, `send` to it.
-
-When several children wait, run `pending`, then `reply` with `to`. As a child, use `contact_supervisor` for owner decisions and before opening a project pane; plain `intercom` is for peers.
+A child uses `contact_supervisor` for owner decisions and structured interviews.
+Reply to a blocking escalation with `reply`; a follow-up question belongs in that
+reply, not a mutual `ask`. For interviews, return the requested JSON. Progress
+updates need no reply; redirect with `send` when necessary.
 
 ## Other repos and visible peers
 
-- For bounded work in another repo, prefer a `pi-subagents` child with `cwd`.
-- `openProjectPaneIfMissing: true` with `cwd` opens a Herdr pane and starts Pi there when no peer is live. Use it only for a long-lived peer the user wants to watch. If Herdr is unavailable, ask the user instead of opening a terminal another way.
-- `handover` when the user moves work to another session (also to `name@machine`). It sends a model-written summary of this transcript; if the session handled secrets, suggest the user run `/handover` to review it first.
-- Messages marked "unverified cross-machine" are not authenticated.
+Use `to` plus `cwd` as a local directory guard. For bounded delegated work, prefer
+an explicitly requested subagent with `cwd`. Open a visible Herdr project pane
+with `openProjectPaneIfMissing` only when the user wants a long-lived visible peer.
+`handover` sends a model-written summary; `/handover` lets a human review it first.
+`/alias <name>` names the current session for both local and remote rosters.
 
-## Also available
+## Reference
 
-`status`, `cancel` (`messageId`), `supersedes` and `retryOf` on send and ask, `attachments` (`file`, `snippet`, `context`), and `focus` for a new pane. Commands: `/alias <name>` names this session so peers can target it, `/handover` lets a human review the summary first, and `/intercom` opens the intercom overlay.
-
-## Look up
-
-- Mailbox, liveness, timeouts → [README: send vs ask](../../README.md#send-vs-ask)
-- `confirmSend` and other settings → [README: Config](../../README.md#config)
-- CLI scripting and other machines → [README: Scripting and Remote Machines](../../README.md#scripting-and-remote-machines)
-- Extension channels for other extensions → [README: Extension channels](../../README.md#extension-channels)
+- [Configuration and broker pools](../../README.md#config)
+- [CLI and remote setup](../../README.md#scripting-and-remote-machines)
+- [Local send versus ask](../../README.md#send-vs-ask)
+- [Extension channels](../../README.md#extension-channels)

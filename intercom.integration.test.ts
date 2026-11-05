@@ -1415,7 +1415,8 @@ test("broker disconnects a connection that exceeds the local rate limit", { conc
 
   try {
     raw.socket.on("error", () => undefined);
-    const closed = once(raw.socket, "close");
+    // ECONNRESET is an expected disconnect here; events.once would reject before close.
+    const closed = new Promise<void>(resolve => raw.socket.once("close", () => resolve()));
     for (let i = 0; i < 300; i += 1) {
       raw.writeMessage(raw.socket, { type: "list", requestId: `flood-${i}` });
     }

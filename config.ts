@@ -34,11 +34,20 @@ export function setIntercomScopeId(scopeId: string | undefined): void {
 export type InboundTriggerPolicy = "always" | "replies" | "never";
 export type BusyDeliveryPolicy = "steer" | "human-first";
 
+export interface CrossMachineHostConfig {
+  /** Trusted SSH destination; omit to keep the Herdr saved target. */
+  target?: string;
+  remoteCommand?: string;
+  enabled?: boolean;
+}
+
 export interface CrossMachineConfig {
   /** Name peers use for this host in their Herdr saved-machine lists. */
   machineName: string;
   /** Command invoked through SSH on remote machines. */
   remoteCommand: string;
+  /** Trusted destinations or per-Herdr-machine command overrides. */
+  machines?: Record<string, CrossMachineHostConfig>;
 }
 
 export interface IntercomConfig {
@@ -209,6 +218,35 @@ export function loadConfig(): IntercomConfig {
           throw new Error(`"crossMachine.remoteCommand" must be a non-empty string`);
         }
         config.crossMachine.remoteCommand = crossMachine.remoteCommand.trim();
+      }
+      if (Object.hasOwn(crossMachine, "machines")) {
+        if (!crossMachine.machines || typeof crossMachine.machines !== "object" || Array.isArray(crossMachine.machines)) {
+          throw new Error('"crossMachine.machines" must be an object');
+        }
+        const machines: Record<string, CrossMachineHostConfig> = Object.create(null);
+        const labels = new Set<string>();
+        for (const [label, value] of Object.entries(crossMachine.machines)) {
+          if (!/^[a-zA-Z0-9_.][a-zA-Z0-9_.-]*$/.test(label) || labels.has(label.toLowerCase())) {
+            throw new Error('"crossMachine.machines" requires unique machine labels (letters, digits, dot, underscore, hyphen)');
+          }
+          labels.add(label.toLowerCase());
+          if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`Invalid remote machine "${label}"`);
+          const row = value as Record<string, unknown>;
+          const settings: CrossMachineHostConfig = {};
+          for (const key of ["target", "remoteCommand"] as const) {
+            if (Object.hasOwn(row, key)) {
+              if (typeof row[key] !== "string" || !row[key].trim() || /[\x00-\x1f\x7f]/.test(row[key])) throw new Error(`Invalid ${key} for remote machine "${label}"`);
+              settings[key] = row[key].trim();
+            }
+          }
+          if (settings.target && (/^[\s-]/.test(settings.target) || /\s/.test(settings.target))) throw new Error(`Invalid target for remote machine "${label}"`);
+          if (Object.hasOwn(row, "enabled")) {
+            if (typeof row.enabled !== "boolean") throw new Error(`Invalid enabled flag for remote machine "${label}"`);
+            settings.enabled = row.enabled;
+          }
+          machines[label] = settings;
+        }
+        config.crossMachine.machines = machines;
       }
     }
 

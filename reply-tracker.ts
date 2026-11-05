@@ -1,3 +1,4 @@
+import { relaySenderName } from "./cross-machine-envelope.ts";
 import { getAskTimeoutMs } from "./config.ts";
 import type { Message, SessionInfo } from "./types.ts";
 
@@ -9,12 +10,16 @@ export interface IntercomContext {
   receivedAt: number;
 }
 
+function senderName(context: IntercomContext): string | undefined {
+  return context.message.crossMachine ? relaySenderName(context.message.crossMachine.origin) : context.from.name;
+}
+
 function matchesPendingSender(context: IntercomContext, to: string): boolean {
   if (context.from.id === to || context.from.id.startsWith(to)) {
     return true;
   }
 
-  return context.from.name?.toLowerCase() === to.toLowerCase();
+  return senderName(context)?.toLowerCase() === to.toLowerCase();
 }
 
 function resolvePendingSender(pending: IntercomContext[], to: string): IntercomContext {
@@ -27,7 +32,7 @@ function resolvePendingSender(pending: IntercomContext[], to: string): IntercomC
   }
 
   const lowerTo = to.toLowerCase();
-  const exactNameMatches = pending.filter((context) => context.from.name?.toLowerCase() === lowerTo);
+  const exactNameMatches = pending.filter((context) => senderName(context)?.toLowerCase() === lowerTo);
   if (exactNameMatches.length === 1) {
     return exactNameMatches[0]!;
   }
@@ -49,6 +54,7 @@ function resolvePendingSender(pending: IntercomContext[], to: string): IntercomC
 export class ReplyTracker {
   private readonly pendingAsks = new Map<string, IntercomContext>();
   private readonly pendingTurnContexts: IntercomContext[] = [];
+  private readonly recentRemoteMessages = new Map<string, IntercomContext>();
   private currentTurnContext: IntercomContext | null = null;
 
   constructor(private readonly askTimeoutMs = getAskTimeoutMs()) {}
@@ -57,6 +63,13 @@ export class ReplyTracker {
     const context = { from, message, receivedAt };
     if (message.expectsReply) {
       this.pendingAsks.set(message.id, context);
+    }
+    if (message.crossMachine) {
+      const origin = message.crossMachine.origin;
+      const key = JSON.stringify([origin.machine.toLowerCase(), origin.sessionId]);
+      this.recentRemoteMessages.delete(key);
+      this.recentRemoteMessages.set(key, context);
+      if (this.recentRemoteMessages.size > 64) this.recentRemoteMessages.delete(this.recentRemoteMessages.keys().next().value!);
     }
     return context;
   }
@@ -83,6 +96,7 @@ export class ReplyTracker {
 
   reset(): void {
     this.pendingAsks.clear();
+    this.recentRemoteMessages.clear();
     this.pendingTurnContexts.length = 0;
     this.currentTurnContext = null;
   }
@@ -91,7 +105,7 @@ export class ReplyTracker {
     this.pruneExpired(now);
 
     if (options.replyTo) {
-      const target = this.pendingAsks.get(options.replyTo);
+      const target = this.pendingAsks.get(options.replyTo) ?? Array.from(this.recentRemoteMessages.values()).find(context => context.message.id === options.replyTo);
       if (!target) {
         throw new Error(`No pending ask with message ID "${options.replyTo}". ${FIND_ASK_HINT}`);
       }
@@ -103,7 +117,9 @@ export class ReplyTracker {
 
     const pending = Array.from(this.pendingAsks.values());
     if (options.to) {
-      return resolvePendingSender(pending, options.to);
+      if (this.currentTurnContext && matchesPendingSender(this.currentTurnContext, options.to)) return this.currentTurnContext;
+      const candidates = new Map([...pending, ...this.recentRemoteMessages.values()].map(context => [context.message.id, context]));
+      return resolvePendingSender(Array.from(candidates.values()), options.to);
     }
 
     if (this.currentTurnContext) {
@@ -144,6 +160,9 @@ export class ReplyTracker {
 
   dismissPendingAsk(replyTo: string): void {
     this.pendingAsks.delete(replyTo);
+    for (const [key, context] of this.recentRemoteMessages) {
+      if (context.message.id === replyTo) this.recentRemoteMessages.delete(key);
+    }
     for (let index = this.pendingTurnContexts.length - 1; index >= 0; index -= 1) {
       if (this.pendingTurnContexts[index]?.message.id === replyTo) {
         this.pendingTurnContexts.splice(index, 1);
@@ -160,6 +179,9 @@ export class ReplyTracker {
   }
 
   private pruneExpired(now: number): void {
+    for (const [key, context] of this.recentRemoteMessages) {
+      if (now - context.receivedAt > this.askTimeoutMs) this.recentRemoteMessages.delete(key);
+    }
     for (const [messageId, context] of this.pendingAsks) {
       if (now - context.receivedAt > this.askTimeoutMs) {
         this.dismissPendingAsk(messageId);

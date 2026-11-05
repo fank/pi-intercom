@@ -1,4 +1,4 @@
-import { BorderedLoader, defineTool, VERSION, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { BorderedLoader, defineTool, truncateHead, VERSION, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { randomUUID } from "crypto";
 import { Type } from "typebox";
@@ -30,13 +30,14 @@ import {
   type IntercomSessionIdentityRequestV1,
 } from "./extension-api.ts";
 import { ReplyTracker } from "./reply-tracker.ts";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { join as joinPath, resolve as resolvePath } from "node:path";
 import { sameCwd } from "./cwd.ts";
 import { formatContextUsage } from "./format-context.ts";
 import { openProjectPane, resolveTargetInCwd, waitForProjectSession, type ProjectPaneLaunch } from "./project-agent.ts";
-import { relaySenderName } from "./cross-machine-envelope.ts";
-import { runCommand, sendCrossMachine } from "./cross-machine-transport.ts";
+import { crossMachineReplyTarget, relaySenderName } from "./cross-machine-envelope.ts";
+import { listRemotePeers, runCommand, sendCrossMachine } from "./cross-machine-transport.ts";
 import { listMachineAgents, listSavedMachines, parseCrossMachineTarget } from "./cross-machine-discovery.ts";
 import { formatHandoverMessage, generateHandoverBody, readGitState } from "./handover.ts";
 import { isIdleWakePending, releaseIdleWake, reserveIdleWake } from "./idle-wake.ts";
@@ -94,11 +95,23 @@ interface DeliveryRequest {
   /** Handovers are always new messages and are not sent once the signal aborts. */
   handover?: boolean;
   noWake?: boolean;
+  exactRemoteSessionId?: boolean;
 }
 
 interface IntercomToolResult {
   content: Array<{ type: "text"; text: string }>;
   details: Record<string, unknown>;
+}
+
+function remoteRosterResult(text: string, details: Record<string, unknown>): IntercomToolResult {
+  const bounded = truncateHead(text);
+  if (!bounded.truncated) return { content: [{ type: "text", text }], details };
+  const path = joinPath(mkdtempSync(joinPath(tmpdir(), "pi-intercom-roster-")), "roster.txt");
+  writeFileSync(path, text, { mode: 0o600 });
+  return {
+    content: [{ type: "text", text: `${bounded.content}\n[Remote roster truncated. Full listing: ${path}]` }],
+    details: { ...details, truncation: bounded, fullOutputPath: path },
+  };
 }
 
 /** `rawTo` is the string the caller addressed; pass "" to disable the name-prefix fallback. */
@@ -1469,7 +1482,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
       : "";
     const bodyText = `${receivedMessage.content.text}${attachmentText}`;
     const replyCommand = config.replyHint && receivedMessage.crossMachine
-      ? `intercom({ action: "send", to: ${JSON.stringify(relaySenderName(receivedMessage.crossMachine.origin))}, message: "..." })`
+      ? `intercom({ action: "reply", message: "..." }) — sends a new async message to the asserted origin, not the transient relay CLI. For a later reply, pass to: ${JSON.stringify(relaySenderName(receivedMessage.crossMachine.origin))}. The source machine must be configured locally.`
       : config.replyHint && receivedMessage.expectsReply
         ? `intercom({ action: "reply", message: "..." })`
         : undefined;
@@ -1921,6 +1934,8 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
             machine: config.crossMachine.machineName,
           }, {
             remoteCommand: config.crossMachine.remoteCommand,
+            machines: config.crossMachine.machines,
+            exactSessionId: request.exactRemoteSessionId,
           });
           const remoteTarget = relaySenderName({ name: remote.agent.name, machine: remote.machine.label });
           pi.appendEntry("intercom_sent", {
@@ -1935,7 +1950,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
           };
         } catch (remoteError) {
           return {
-            content: [{ type: "text", text: `Explicit cross-machine message to "${to}" was not delivered: ${getErrorMessage(remoteError)}` }],
+            content: [{ type: "text", text: `Explicit cross-machine send to "${to}" failed: ${getErrorMessage(remoteError)}` }],
             details: { error: true, crossMachine: false },
           };
         }
@@ -2638,15 +2653,22 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
   pi.registerTool(defineTool({
     name: "intercom",
     label: "Intercom",
-    description: `Send a message to another pi session running on this machine.
-Use this to communicate findings, request help, or coordinate work with other sessions.
-
-Target a session by name, full session ID, or the short id shown in parentheses
-by "list" (a leading prefix of the ID is enough). Prefer the short id when two
-sessions share a name. Re-list before reusing a session ID; skip if it resolves to self.
+    description: `Communicate with live Pi peers locally or across configured SSH machines.
+Discover first: list/list-cwd show only the local broker pool; list-remote without
+machine shows trusted machines, and list-remote with machine shows real broker aliases,
+cwd and status there. Send to a listed role/runtime alias, or alias@machine remotely.
+Never infer an address from a terminal title, pane name, or repository directory.
+Use send asynchronously for long collection requests; ask blocks and is local-only.
+Use reply for an incoming message: cross-host reply sends a new async message back
+to the origin session internally, never to a transient SSH CLI mailbox. Full IDs remain
+available only for explicit disambiguation. Re-list if a target is missing or ambiguous.
+Cross-host attachments, ask, replyTo, noWake and cwd/project routing are unsupported.
 
 Usage:
-  intercom({ action: "list" })                    → List active sessions
+  intercom({ action: "list-remote" })             → List trusted machines (no remote connections)
+  intercom({ action: "list-remote", machine: "macbook" }) → List actual remote aliases, cwd and status
+  intercom({ action: "send", to: "worker@macbook", message: "..." }) → Send over SSH
+  intercom({ action: "list" })                    → List local active sessions
   intercom({ action: "list-cwd" })                → List sessions in the current working directory
   intercom({ action: "list-cwd", cwd: "/path" })  → List sessions in a specific directory
   intercom({ action: "send", to: "name-or-id", message: "..." })  → Send message
@@ -2660,14 +2682,15 @@ Usage:
   intercom({ action: "pending" })                                      → List unresolved inbound asks
   intercom({ action: "status" })                  → Show connection status`,
     promptSnippet:
-      "Use to coordinate with other local pi sessions: list peers, send updates, ask for help, or check intercom connectivity.",
+      "Discover local or SSH-hosted Pi peers, send asynchronously to listed aliases, and reply to the original session.",
 
     parameters: Type.Object({
-      action: StringEnum(["list", "list-cwd", "send", "ask", "handover", "reply", "pending", "status", "cancel"] as const, {
-        description: "Action: 'list', 'list-cwd', 'send', 'ask', 'handover', 'reply', 'pending', 'status', or 'cancel'. 'handover' summarizes this session with the current model and sends it to the target, which acts on it; 'message' is the optional next task.",
+      action: StringEnum(["list", "list-cwd", "list-remote", "send", "ask", "handover", "reply", "pending", "status", "cancel"] as const, {
+        description: "Discover with list/list-cwd (local) or list-remote (SSH); send asynchronously; ask is local-only; reply returns to the incoming sender. handover summarizes and sends the next task.",
       }),
+      machine: Type.Optional(Type.String({ description: "For list-remote only: trusted machine label. Omit to list configured machines without contacting them." })),
       to: Type.Optional(Type.String({
-        description: "Target session: name, full session ID, or the short id shown in parentheses by 'list' (a leading ID prefix resolves; when no session has this exact name or ID, a leading name prefix shared by exactly one connected session also resolves, otherwise use the full name). For send/ask/handover with cwd, omit to target the sole live session in that cwd or the newly opened project-pane session. For 'reply', disambiguates the pending ask.",
+        description: "Use a role/runtime alias from list/list-cwd, or alias@machine from list-remote. Target session: name, full session ID, or the short id shown in parentheses by 'list' (a leading ID prefix resolves; when no session has this exact name or ID, a leading name prefix shared by exactly one connected session also resolves, otherwise use the full name). For send/ask/handover with cwd, omit to target the sole live session in that cwd or the newly opened project-pane session. For 'reply', disambiguates the pending ask.",
       })),
       message: Type.Optional(Type.String({
         description: "Message to send (for 'send', 'ask', or 'reply' action). For 'handover', the optional next task for the receiver.",
@@ -2717,9 +2740,30 @@ Usage:
 
       syncPresenceIdentity(ctx.sessionManager.getSessionId());
 
-      const { action, to, message, attachments, replyTo, messageId, supersedes, retryOf, cwd, openProjectPaneIfMissing, focus, noWake } = params;
+      const { action, machine, to, message, attachments, replyTo, messageId, supersedes, retryOf, cwd, openProjectPaneIfMissing, focus, noWake } = params;
+      if (machine && action !== "list-remote") return { content: [{ type: "text", text: "machine is only valid for list-remote; use alias@machine to send." }], details: { error: true } };
 
       switch (action) {
+        case "list-remote": {
+          try {
+            const roster = await listRemotePeers(machine, config.crossMachine);
+            if (roster.machines) {
+              const lines = roster.machines.map(host => `- ${host.label} · ${host.enabled ? "enabled" : "disabled"}`);
+              return remoteRosterResult(
+                `**Trusted remote machines:**\n${lines.join("\n") || "None configured."}\nUse list-remote with machine: "label" to discover its broker aliases. Configure Herdr saved machines or crossMachine.machines; unknown hosts are never guessed.`,
+                { machines: roster.machines },
+              );
+            }
+            const agents = (roster.agents ?? []).map(agent => ({ ...agent, address: `${agent.name}@${roster.machine!.label}` }));
+            const lines = agents.map(agent => `- ${JSON.stringify(agent.address)} · ${agent.status ?? "unknown"} · cwd ${JSON.stringify(agent.cwd ?? "unknown")}`);
+            return remoteRosterResult(
+              `**Remote broker peers on ${roster.machine!.label}:**\n${lines.join("\n") || "No live peers in the destination broker pool."}\nSend to a listed alias@machine, not a pane name. Duplicate aliases require disambiguation; no target is chosen automatically.`,
+              { machine: roster.machine!.label, agents },
+            );
+          } catch (error) {
+            return { content: [{ type: "text", text: `Remote discovery failed: ${getErrorMessage(error)}` }], details: { error: true } };
+          }
+        }
         case "list": {
           try {
             const mySessionId = connectedClient.sessionId;
@@ -2994,6 +3038,18 @@ Usage:
 
           try {
             const target = replyTracker.resolveReplyTarget({ to, replyTo });
+            if (target.message.crossMachine) {
+              if (replyTo || attachments?.length || supersedes || retryOf || cwd || openProjectPaneIfMissing || noWake) {
+                throw new Error("Cross-host reply only supports a new asynchronous text message; replyTo, attachments and lifecycle/project options are unsupported.");
+              }
+              const result = await deliverMessage(connectedClient, ctx, _signal, {
+                to: crossMachineReplyTarget(target.message.crossMachine.origin),
+                exactRemoteSessionId: true,
+                message,
+              });
+              if (!result.details?.error) dismissIncomingAsk(target.message.id);
+              return result;
+            }
             if (target.from.id === connectedClient.sessionId) {
               return {
                 content: [{ type: "text", text: "Cannot message the current session" }],
@@ -3301,7 +3357,7 @@ Usage:
     }
     if (!getLiveContext(ctx, generation)) return;
 
-    const discoveryDeps = { run: runCommand, herdrBin: process.env.HERDR_BIN_PATH ?? "herdr" };
+    const discoveryDeps = { ...config.crossMachine, run: runCommand, herdrBin: process.env.HERDR_BIN_PATH ?? "herdr" };
     const lister: RemoteSessionLister = {
       listMachines: () => listSavedMachines(discoveryDeps),
       listAgents: (machine) => listMachineAgents(machine, discoveryDeps),

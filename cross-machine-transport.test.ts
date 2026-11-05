@@ -10,81 +10,44 @@ import {
 
 const fakeSessionId = "00000000-0000-4000-8000-000000000001";
 const machines = JSON.stringify([{ label: "workstation", target: "workstation.example", enabled: true }]);
-const agents = JSON.stringify({ id: "cli:agent:list", result: { agents: [{
-  agent: "pi",
-  name: "reviewer",
-  agent_session: { agent: "pi", kind: "path", source: "herdr:pi", value: `/home/user/.pi/agent/sessions/session_${fakeSessionId}.jsonl` },
-}] } });
 const origin = { name: "worker", sessionId: fakeSessionId, machine: "laptop" };
-const intercomList = JSON.stringify({ ok: true, sessions: [{ name: "host", id: fakeSessionId, model: "m", cwd: "/" }] });
+const intercomList = JSON.stringify({ ok: true, sessions: [{ name: "reviewer", id: fakeSessionId, model: "m", cwd: "/" }] });
 
 function discoveryResult(command: string, args: string[]) {
   if (args[0] === "machine") return { code: 0, stdout: machines, stderr: "" };
-  if (command === "herdr") return { code: 0, stdout: agents, stderr: "" };
+  if (command === "ssh" && args.at(-1)?.endsWith(" list --json")) return { code: 0, stdout: intercomList, stderr: "" };
   return undefined;
 }
 
-test("discovers only the selected machine and sends hostile message text only on stdin", async () => {
+test("broker alias discovery and relay use the same trusted command and saved target", async () => {
   const calls: Array<{ command: string; args: string[]; stdin?: string; timeoutMs?: number }> = [];
   const run: CommandRunner = async (command, args, stdin, timeoutMs) => {
-    calls.push({ command, args, stdin, timeoutMs });
-    if (command === "herdr" && args[0] === "machine") {
-      return { code: 0, stdout: JSON.stringify([
-        { label: "laptop", target: "laptop.example", enabled: true },
-        { label: "workstation", target: "workstation.example", enabled: true },
-        { label: "disabled", target: "disabled.example", enabled: false },
-      ]), stderr: "" };
-    }
-    if (command === "herdr") {
-      return args[1] === "workstation" ? { code: 0, stdout: agents, stderr: "" } : { code: 0, stdout: JSON.stringify({ result: { agents: [] } }), stderr: "" };
-    }
-    return { code: 0, stdout: '{"ok":true}', stderr: "" };
+    calls.push({command,args,stdin,timeoutMs});
+    return discoveryResult(command,args) ?? {code:0,stdout:'{"ok":true,"delivered":true}',stderr:""};
   };
-  const hostileText = 'hello; $(touch /tmp/nope)\n"quoted" && exit 9';
-  const result = await sendCrossMachine("reviewer@workstation", hostileText, origin, {
-    run,
-    herdrBin: "herdr",
-    remoteCommand: "/opt/pi tools/pi-intercom --profile trusted",
-  });
-  assert.equal(result.machine.label, "workstation");
-  assert.equal(calls.some((call) => call.args.includes("disabled")), false);
-  const ssh = calls.at(-1)!;
-  assert.equal(ssh.command, "ssh");
-  assert.deepEqual(ssh.args, ["workstation.example", "/opt/pi tools/pi-intercom --profile trusted relay --envelope-stdin --json"]);
-  assert.equal(ssh.args.some((arg) => arg.includes(hostileText)), false);
-  assert.equal(JSON.parse(ssh.stdin!).text, hostileText);
-  assert.equal(ssh.timeoutMs, DELIVERY_TIMEOUT_MS);
-  assert.equal(calls.filter((call) => call.command === "herdr").every((call) => call.timeoutMs === DISCOVERY_TIMEOUT_MS), true);
-});
-
-test("delivers to a machine without Herdr over non-interactive SSH, addressed by session id", async () => {
-  const sshCalls: Array<{ args: string[]; stdin?: string }> = [];
-  const run: CommandRunner = async (command, args, stdin) => {
-    if (command === "herdr") throw Object.assign(new Error("spawn herdr ENOENT"), { code: "ENOENT" });
-    sshCalls.push({ args, stdin });
-    return { code: 0, stdout: args.at(-1)!.endsWith(" list --json") ? intercomList : '{"ok":true}', stderr: "" };
-  };
-  const result = await sendCrossMachine("host@buildbox", "hi", origin, { run, herdrBin: "herdr", remoteCommand: "pi-intercom" });
-  assert.equal(result.machine.label, "buildbox");
-  assert.deepEqual(sshCalls.at(-1)!.args, ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "buildbox", "pi-intercom relay --envelope-stdin --json"]);
-  assert.equal(JSON.parse(sshCalls.at(-1)!.stdin!).target, fakeSessionId);
-});
-
-test("finds a Pi session outside a Herdr pane in a saved machine's intercom roster over the saved SSH target", async () => {
-  const sshCalls: string[][] = [];
-  const run: CommandRunner = async (command, args) => {
-    if (command === "herdr") {
-      return args[0] === "machine" ? { code: 0, stdout: machines, stderr: "" } : { code: 0, stdout: JSON.stringify({ result: { agents: [] } }), stderr: "" };
-    }
-    sshCalls.push(args);
-    return { code: 0, stdout: args.at(-1)!.endsWith(" list --json") ? intercomList : '{"ok":true}', stderr: "" };
-  };
-  const result = await sendCrossMachine("host@workstation", "hi", origin, { run, herdrBin: "herdr", remoteCommand: "pi-intercom" });
-  assert.equal(result.machine.label, "workstation");
-  assert.deepEqual(sshCalls, [
-    ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "workstation.example", "pi-intercom list --json"],
-    ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "workstation.example", "pi-intercom relay --envelope-stdin --json"],
+  const text = 'hello; $(touch /tmp/nope)\n"quoted" && exit 9';
+  const command = "/opt/node /opt/intercom/cli.mjs";
+  const result = await sendCrossMachine("reviewer@workstation",text,origin,{run,herdrBin:"herdr",remoteCommand:"pi-intercom",machines:{workstation:{remoteCommand:command}}});
+  assert.equal(result.agent.name,"reviewer");
+  const ssh = calls.filter(call=>call.command === "ssh");
+  assert.deepEqual(ssh.map(call=>call.args),[
+    ["-o","BatchMode=yes","-o","ConnectTimeout=5","workstation.example",command+" list --json"],
+    ["-o","BatchMode=yes","-o","ConnectTimeout=5","workstation.example",command+" relay --envelope-stdin --json"],
   ]);
+  const wire = JSON.parse(ssh[1]!.stdin!);
+  assert.equal(wire.target,fakeSessionId);
+  assert.deepEqual(wire.origin,origin);
+  assert.equal(wire.text,text);
+  assert.equal(ssh.some(call=>call.args.some(arg=>arg.includes(text))),false);
+  assert.equal(ssh[0]!.timeoutMs,DISCOVERY_TIMEOUT_MS);
+  assert.equal(ssh[1]!.timeoutMs,DELIVERY_TIMEOUT_MS);
+});
+
+test("unknown destinations do not silently fall back to arbitrary SSH hosts", async () => {
+  const calls: string[] = [];
+  const run: CommandRunner = async (command,args) => { calls.push(command); return discoveryResult(command,args)!; };
+  await assert.rejects(sendCrossMachine("reviewer@typo","hi",origin,{run,herdrBin:"herdr"}),/unknown or disabled/);
+  assert.deepEqual(calls,["herdr"]);
 });
 
 test("rejects empty or control-character remote commands before invoking SSH", async () => {
@@ -150,14 +113,24 @@ test("runCommand still reaps a child that closes stdin and then times out", asyn
   assert.deepEqual(result, { stdout: "", stderr: "stdin closed", code: 124, timedOut: true });
 });
 
-test("non-JSON and incompatible remote output report incompatible relay support", async () => {
-  for (const stdout of ["", '{"ok":"yes"}', '{"version":2,"ok":true}']) {
-    const run: CommandRunner = async (command, args) => discoveryResult(command, args) ?? { code: 1, stdout, stderr: "unknown command: relay" };
-    await assert.rejects(
-      sendCrossMachine("reviewer@workstation", "hi", origin, { run, herdrBin: "herdr" }),
-      /no compatible relay support and needs upgrading/,
-    );
+test("SSH failures and non-JSON relay responses preserve diagnostics and unknown outcomes", async () => {
+  for (const response of [
+    {code:255,stdout:"",stderr:"Host key verification failed."},
+    {code:124,stdout:"",stderr:"",timedOut:true},
+    {code:127,stdout:"",stderr:"pi-intercom: command not found"},
+  ]) {
+    const run: CommandRunner = async (command,args) => discoveryResult(command,args) ?? response;
+    await assert.rejects(sendCrossMachine("reviewer@workstation","hi",origin,{run,herdrBin:"herdr"}), /Delivery outcome is unknown/);
   }
+});
+
+test("incompatible JSON relay output reports the version problem, and ok alone is not delivery", async () => {
+  for (const stdout of ['{"ok":"yes"}','{"version":2,"ok":true}']) {
+    const run: CommandRunner = async (command,args) => discoveryResult(command,args) ?? {code:0,stdout,stderr:""};
+    await assert.rejects(sendCrossMachine("reviewer@workstation","hi",origin,{run,herdrBin:"herdr"}), /no compatible relay support/);
+  }
+  const run: CommandRunner = async (command,args) => discoveryResult(command,args) ?? {code:0,stdout:'{"ok":true,"delivered":false}',stderr:""};
+  await assert.rejects(sendCrossMachine("reviewer@workstation","hi",origin,{run,herdrBin:"herdr"}), /did not confirm delivery/);
 });
 
 test("structured remote failure preserves the reported error", async () => {
