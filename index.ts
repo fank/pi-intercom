@@ -552,6 +552,19 @@ function sessionIdPrefixes(sessions: SessionInfo[]): Map<string, string> {
   }
   return prefixes;
 }
+function sessionHerdrLabels(session: SessionInfo): string[] {
+  const location = session.herdrLocation;
+  if (location?.status !== "current") {
+    return [];
+  }
+  return [location.workspace.label, location.tab.label].filter((label) => label.trim().length > 0);
+}
+function sessionResolutionLabels(session: SessionInfo): string[] {
+  return [session.name, ...sessionHerdrLabels(session)].filter((label): label is string => Boolean(label?.trim()));
+}
+function sessionDisplayName(session: SessionInfo): string {
+  return session.name || sessionHerdrLabels(session)[0] || "Unnamed session";
+}
 function parseSubagentIntercomPayload(payload: unknown): { to: string; message: string; requestId?: string } | null {
   if (typeof payload !== "object" || payload === null) {
     return null;
@@ -1719,6 +1732,19 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     if (byIdPrefix.length > 1) {
       throw new Error(`Multiple sessions match ID prefix "${nameOrId}". Use a longer session ID prefix.`);
     }
+
+    // Fall back to a unique Herdr tab/workspace label (already surfaced by "list"), so an
+    // agent can address a session the way a human sees it. Ambiguous labels fail closed.
+    const lowerLabel = nameOrId.toLowerCase();
+    const byHerdrLabel = sessions.filter((session) => sessionHerdrLabels(session).some((label) => label.toLowerCase() === lowerLabel));
+    if (byHerdrLabel.length === 1) {
+      return byHerdrLabel[0]!.id;
+    }
+    if (byHerdrLabel.length > 1) {
+      const prefixes = sessionIdPrefixes(sessions);
+      const ids = byHerdrLabel.map((session) => prefixes.get(session.id)!).join(", ");
+      throw new Error(`Multiple sessions match Herdr label "${nameOrId}". Address one by the id shown in parentheses by "list" (${ids}).`);
+    }
     return null;
   }
   /**
@@ -1736,17 +1762,18 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     }
     const sessions = await activeClient.listSessions();
     const lowerName = rawTo.toLowerCase();
-    const byNamePrefix = sessions.filter(s => s.name?.toLowerCase().startsWith(lowerName) ?? false);
+    const byNamePrefix = sessions.filter(s => sessionResolutionLabels(s).some(label => label.toLowerCase().startsWith(lowerName)));
     if (byNamePrefix.length > 1) {
       const prefixes = sessionIdPrefixes(sessions);
-      const candidates = byNamePrefix.map((session) => `"${session.name}" (${prefixes.get(session.id)!})`).join(", ");
-      throw new Error(`Multiple session names start with "${rawTo}": ${candidates}. Use the full name or the id shown in parentheses by "list".`);
+      const candidates = byNamePrefix.map((session) => `"${sessionDisplayName(session)}" (${prefixes.get(session.id)!})`).join(", ");
+      throw new Error(`Multiple sessions start with "${rawTo}": ${candidates}. Use the full name or the id shown in parentheses by "list".`);
     }
     const match = byNamePrefix[0];
     if (!match || match.id === activeClient.sessionId) {
       return { result, display, resolution: "", noMatchText: describeNoSessionMatch(sessions, rawTo) };
     }
-    return { result: await attempt(match.id), display: match.name!, resolution: ` ("${rawTo}" resolved to "${match.name}")` };
+    const displayName = sessionDisplayName(match);
+    return { result: await attempt(match.id), display: displayName, resolution: ` ("${rawTo}" resolved to "${displayName}")` };
   }
   /** Blocking variant: each attempt registers its reply waiter before sending and releases it when refused, so a retry can register its own. */
   async function askWithNamePrefixFallback(activeClient: IntercomClient, target: PrefixTarget, payload: Omit<Parameters<IntercomClient["send"]>[1], "messageId" | "expectsReply">, wait: {
@@ -1790,24 +1817,23 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     let best: SessionInfo | null = null;
     let bestDistance = Number.POSITIVE_INFINITY;
     for (const session of sessions) {
-      if (!session.name) {
-        continue;
-      }
-      const candidate = session.name.toLowerCase();
-      const limit = Math.max(2, Math.floor(Math.max(candidate.length, needle.length) / 4));
-      const distance = editDistance(candidate, needle);
-      if (distance <= limit && distance < bestDistance) {
-        best = session;
-        bestDistance = distance;
+      for (const label of sessionResolutionLabels(session)) {
+        const candidate = label.toLowerCase();
+        const limit = Math.max(2, Math.floor(Math.max(candidate.length, needle.length) / 4));
+        const distance = editDistance(candidate, needle);
+        if (distance <= limit && distance < bestDistance) {
+          best = session;
+          bestDistance = distance;
+        }
       }
     }
     return best;
   }
   function describeNoSessionMatch(sessions: SessionInfo[], to: string): string {
     const nearest = nearestSessionName(sessions, to);
-    if (nearest?.name) {
+    if (nearest) {
       const prefixes = sessionIdPrefixes(sessions);
-      return `No connected session matches "${to}". Nearest name: "${nearest.name}" (${prefixes.get(nearest.id)!}). Run intercom list and address the session by its full name or the id shown in parentheses.`;
+      return `No connected session matches "${to}". Nearest name: "${sessionDisplayName(nearest)}" (${prefixes.get(nearest.id)!}). Run intercom list and address the session by its full name or the id shown in parentheses.`;
     }
     return `No connected session matches "${to}". Run intercom list for connected sessions.`;
   }
@@ -2690,7 +2716,7 @@ Usage:
       }),
       machine: Type.Optional(Type.String({ description: "For list-remote only: trusted machine label. Omit to list configured machines without contacting them." })),
       to: Type.Optional(Type.String({
-        description: "Use a role/runtime alias from list/list-cwd, or alias@machine from list-remote. Target session: name, full session ID, or the short id shown in parentheses by 'list' (a leading ID prefix resolves; when no session has this exact name or ID, a leading name prefix shared by exactly one connected session also resolves, otherwise use the full name). For send/ask/handover with cwd, omit to target the sole live session in that cwd or the newly opened project-pane session. For 'reply', disambiguates the pending ask.",
+        description: "Use a role/runtime alias from list/list-cwd, or alias@machine from list-remote. Target session: name, full session ID, a Herdr tab/workspace label (shown by 'list'), or the short id shown in parentheses by 'list' (a leading ID prefix resolves; when no session has this exact name or ID or label, a leading name or label prefix shared by exactly one connected session also resolves, otherwise use the full name). For send/ask/handover with cwd, omit to target the sole live session in that cwd or the newly opened project-pane session. For 'reply', disambiguates the pending ask.",
       })),
       message: Type.Optional(Type.String({
         description: "Message to send (for 'send', 'ask', or 'reply' action). For 'handover', the optional next task for the receiver.",

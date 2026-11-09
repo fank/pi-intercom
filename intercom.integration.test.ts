@@ -1769,7 +1769,7 @@ test("intercom tool rejects an ambiguous name prefix with both candidate ids", {
 
     const result = await intercomTool.execute("send-ambiguous-prefix", { action: "send", to: "worker-", message: "which one?" }, new AbortController().signal, undefined, harness.ctx);
     assert.equal(result.details?.error, true);
-    assert.match(result.content[0]?.text ?? "", /Multiple session names start with "worker-"/);
+    assert.match(result.content[0]?.text ?? "", /Multiple sessions start with "worker-"/);
     assert.match(result.content[0]?.text ?? "", /amb-alpha/);
     assert.match(result.content[0]?.text ?? "", /amb-beta/);
   } finally {
