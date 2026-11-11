@@ -65,6 +65,42 @@ test("rejects empty or control-character remote commands before invoking SSH", a
   }
 });
 
+test("discovery commands receive EOF without an unused stdin pipe", async () => {
+  const result = await runCommand(process.execPath, ["-e", `
+    const fs = require("node:fs");
+    const stat = fs.fstatSync(0);
+    process.stdout.write(JSON.stringify({ pipe: stat.isFIFO() || stat.isSocket(), input: fs.readFileSync(0, "utf8") }));
+  `], undefined, 5_000);
+  assert.equal(result.code, 0);
+  assert.deepEqual(JSON.parse(result.stdout), { pipe: false, input: "" });
+});
+
+test("explicit empty input retains the caller-requested stdin pipe", async () => {
+  const result = await runCommand(process.execPath, ["-e", `
+    const fs = require("node:fs");
+    const stat = fs.fstatSync(0);
+    process.stdout.write(JSON.stringify({ pipe: stat.isFIFO() || stat.isSocket(), input: fs.readFileSync(0, "utf8") }));
+  `], "", 5_000);
+  assert.equal(result.code, 0);
+  assert.deepEqual(JSON.parse(result.stdout), { pipe: true, input: "" });
+});
+
+test("discovery failures report that relay was not attempted", async () => {
+  let relayAttempted = false;
+  const run: CommandRunner = async (command, args) => {
+    if (command === "ssh") {
+      relayAttempted ||= args.at(-1)?.includes(" relay ") ?? false;
+      throw new Error("Cannot call end after a stream was destroyed");
+    }
+    return discoveryResult(command, args)!;
+  };
+  await assert.rejects(
+    sendCrossMachine("reviewer@workstation", "not sent", origin, { run, herdrBin: "herdr" }),
+    /discovery.*before relay.*No message was sent/,
+  );
+  assert.equal(relayAttempted, false);
+});
+
 test("runCommand returns an awaitable timeout result after terminating its child", async () => {
   const started = Date.now();
   const result = await runCommand(process.execPath, ["-e", "setTimeout(() => {}, 10_000)"], undefined, 30);

@@ -48,13 +48,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 export const runCommand: CommandRunner = (command, args, input, timeoutMs) => new Promise((resolve, reject) => {
-  const child = spawn(command, args, { stdio: ["pipe", "pipe", "pipe"] });
+  // Discovery has no payload; an unused pipe can fail during teardown even
+  // after the command succeeds. Keep strict pipe checks for explicit input.
+  const child = spawn(command, args, { stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"] });
   let stdout = "";
   let stderr = "";
   let timedOut = false;
   let settled = false;
   let stdinError: Error | undefined;
-  let stdinClosed = false;
+  let stdinClosed = child.stdin === null;
   let exitCode: number | null | undefined;
   const cleanup = () => {
     if (timer) clearTimeout(timer);
@@ -91,16 +93,18 @@ export const runCommand: CommandRunner = (command, args, input, timeoutMs) => ne
   child.on("close", onClose);
   // stdin errors belong to the pipe, not the ChildProcess. Wait for both to
   // close so a late write error cannot turn incomplete input into success.
-  child.stdin.on("error", (error) => { stdinError = error; });
-  child.stdin.on("close", () => {
-    stdinClosed = true;
-    finish();
-  });
-  // Only this callback sees ECANCELED when stdin is destroyed without an 'error' event
-  // (the child exits 0 while another process still holds the pipe).
-  child.stdin.end(input, (error?: Error | null) => {
-    if (error) stdinError ??= error;
-  });
+  if (child.stdin) {
+    child.stdin.on("error", (error) => { stdinError = error; });
+    child.stdin.on("close", () => {
+      stdinClosed = true;
+      finish();
+    });
+    // Only this callback sees ECANCELED when stdin is destroyed without an 'error' event
+    // (the child exits 0 while another process still holds the pipe).
+    child.stdin.end(input, (error?: Error | null) => {
+      if (error) stdinError ??= error;
+    });
+  }
 });
 
 function relaySupportError(machine: string): Error {
@@ -123,6 +127,9 @@ export async function sendCrossMachine(
     machines: deps.machines,
     exactSessionId: deps.exactSessionId,
     ...(deps.discoveryTimeoutMs === undefined ? {} : { discoveryTimeoutMs: deps.discoveryTimeoutMs }),
+  }).catch((error: unknown) => {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Remote discovery for "${target}" failed before relay: ${detail}. No message was sent.`, { cause: error });
   });
   const envelope: CrossMachineEnvelope = { version: 1, target: match.agent.sessionId ?? match.agent.name, text, origin, trust: "ssh-asserted" };
   let delivered: CommandResult;
